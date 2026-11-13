@@ -1,42 +1,39 @@
 package render
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"time"
 
-	"voice-timeline-renderer/internal/audiocodec"
 	"voice-timeline-renderer/internal/domain"
 )
+
+// receiptSchemaVersion is bumped whenever the receipt shape changes. Version
+// 2 adds the per-joint transition report.
+const receiptSchemaVersion = 2
 
 func buildReceipt(
 	renderID string,
 	plan domain.Timeline,
-	encoded []byte,
-	normalized normalizationResult,
-	spans []preparedSpan,
+	spans []plannedSpan,
+	joints []jointDecision,
+	beforePeakDBFS float64,
+	gainDB float64,
+	encoded encodeResult,
 	now time.Time,
 ) (domain.RenderReceipt, domain.OutputAsset, error) {
-	decoded, info, err := audiocodec.DecodeWAV(encoded)
-	if err != nil {
-		return domain.RenderReceipt{}, domain.OutputAsset{}, err
-	}
-	measurements := audiocodec.Measure(decoded.Samples)
-	digest := sha256.Sum256(encoded)
-	digestText := hex.EncodeToString(digest[:])
 	output := domain.OutputAsset{
-		Digest:        digestText,
-		ByteCount:     int64(len(encoded)),
-		SampleRate:    info.SampleRate,
-		Channels:      info.Channels,
-		BitsPerSample: info.BitsPerSample,
-		FrameCount:    info.FrameCount,
-		DurationMS:    framesToMilliseconds(info.FrameCount, info.SampleRate),
-		PeakDBFS:      measurements.PeakDBFS,
-		RMSDBFS:       measurements.RMSDBFS,
+		Digest:        encoded.Digest,
+		ByteCount:     encoded.ByteSize,
+		SampleRate:    plan.SampleRate,
+		Channels:      plan.OutputChannels,
+		BitsPerSample: 16,
+		FrameCount:    encoded.Frames,
+		DurationMS:    framesToMilliseconds(encoded.Frames, plan.SampleRate),
+		PeakDBFS:      encoded.Metrics.PeakDBFS,
+		RMSDBFS:       encoded.Metrics.RMSDBFS,
 	}
 	receiptSpans := make([]domain.ReceiptSpan, 0, len(spans))
+	transitions := make([]domain.ReceiptTransition, 0, len(spans))
 	warnings := make([]string, 0)
 	for _, span := range spans {
 		receiptSpans = append(receiptSpans, domain.ReceiptSpan{
@@ -55,21 +52,40 @@ func buildReceipt(
 		if span.ChannelAction != "unchanged" {
 			warnings = append(warnings, fmt.Sprintf("span %d applied %s", span.Index, span.ChannelAction))
 		}
+		joint := joints[span.Index]
+		if span.Index == 0 || joint.Frames <= 0 {
+			continue
+		}
+		transitions = append(transitions, domain.ReceiptTransition{
+			SpanIndex:       span.Index,
+			CrossfadeFrames: joint.Frames,
+			Correlation:     joint.Correlation,
+			Curve:           joint.Curve,
+			Exponent:        joint.Exponent,
+			Conflict:        joint.Conflict,
+		})
+		if joint.Conflict == conflictCancel {
+			warnings = append(warnings, fmt.Sprintf(
+				"span %d crossfade: anti-correlated overlap (correlation %.3f); equal-power floor retained and the residual seam dip is inherent to the content",
+				span.Index, joint.Correlation,
+			))
+		}
 	}
 	receipt := domain.RenderReceipt{
-		SchemaVersion: 1,
+		SchemaVersion: receiptSchemaVersion,
 		RenderID:      renderID,
 		TimelineID:    plan.ID,
 		Output:        output,
 		Normalization: domain.NormalizationReceipt{
 			RequestedPeakDBFS: plan.TargetPeakDBFS,
-			BeforePeakDBFS:    normalized.Before.PeakDBFS,
-			AppliedGainDB:     normalized.GainDB,
-			OutputPeakDBFS:    measurements.PeakDBFS,
+			BeforePeakDBFS:    beforePeakDBFS,
+			AppliedGainDB:     gainDB,
+			OutputPeakDBFS:    encoded.Metrics.PeakDBFS,
 		},
-		Spans:     receiptSpans,
-		Warnings:  warnings,
-		CreatedAt: now.UTC(),
+		Spans:       receiptSpans,
+		Transitions: transitions,
+		Warnings:    warnings,
+		CreatedAt:   now.UTC(),
 	}
 	return receipt, output, nil
 }

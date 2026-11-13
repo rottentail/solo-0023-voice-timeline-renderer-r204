@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"io"
 	"sync"
 
 	"voice-timeline-renderer/internal/domain"
@@ -10,12 +11,12 @@ import (
 type Repository interface {
 	SaveSource(domain.SourceAsset, []byte) error
 	GetSourceMeta(string) (domain.SourceAsset, error)
-	GetSource(string) (domain.SourceAsset, []byte, error)
+	OpenSourceMedia(string) (io.ReadCloser, error)
 	SaveTimeline(domain.Timeline) error
 	GetTimeline(string) (domain.Timeline, error)
 	SaveJob(domain.RenderJob) error
 	GetJob(string) (domain.RenderJob, error)
-	CommitRenderArtifacts(string, []byte, domain.RenderReceipt) error
+	BeginRenderStaging(string) (domain.RenderStaging, error)
 	GetRenderOutput(string) ([]byte, domain.RenderReceipt, error)
 }
 

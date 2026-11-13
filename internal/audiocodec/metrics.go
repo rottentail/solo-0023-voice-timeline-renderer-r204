@@ -4,25 +4,42 @@ import "math"
 
 const silenceFloorDBFS = -120.0
 
-func Measure(samples []float32) Metrics {
-	if len(samples) == 0 {
+// MetricsAccumulator folds peak and RMS statistics over a stream of samples
+// with O(1) memory. Feeding it the same samples as Measure yields identical
+// results.
+type MetricsAccumulator struct {
+	peak       float64
+	sumSquares float64
+	count      int64
+}
+
+func (acc *MetricsAccumulator) Add(sample float32) {
+	value := float64(sample)
+	absolute := math.Abs(value)
+	if absolute > acc.peak {
+		acc.peak = absolute
+	}
+	acc.sumSquares += value * value
+	acc.count++
+}
+
+func (acc *MetricsAccumulator) Metrics() Metrics {
+	if acc.count == 0 {
 		return Metrics{PeakDBFS: silenceFloorDBFS, RMSDBFS: silenceFloorDBFS}
 	}
-	peak := 0.0
-	sumSquares := 0.0
-	for _, sample := range samples {
-		value := float64(sample)
-		absolute := math.Abs(value)
-		if absolute > peak {
-			peak = absolute
-		}
-		sumSquares += value * value
-	}
-	rms := math.Sqrt(sumSquares / float64(len(samples)))
+	rms := math.Sqrt(acc.sumSquares / float64(acc.count))
 	return Metrics{
-		PeakDBFS: amplitudeDBFS(peak),
+		PeakDBFS: amplitudeDBFS(acc.peak),
 		RMSDBFS:  amplitudeDBFS(rms),
 	}
+}
+
+func Measure(samples []float32) Metrics {
+	var acc MetricsAccumulator
+	for _, sample := range samples {
+		acc.Add(sample)
+	}
+	return acc.Metrics()
 }
 
 func amplitudeDBFS(value float64) float64 {

@@ -1,9 +1,8 @@
 package storage
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -55,23 +54,18 @@ func (repo *Repository) GetSourceMeta(id string) (domain.SourceAsset, error) {
 	return asset, nil
 }
 
-func (repo *Repository) GetSource(id string) (domain.SourceAsset, []byte, error) {
-	asset, err := repo.GetSourceMeta(id)
-	if err != nil {
-		return domain.SourceAsset{}, nil, err
-	}
+// OpenSourceMedia opens the stored source payload for streaming reads. The
+// returned handle also implements io.ReaderAt, letting the renderer pull
+// bounded frame windows instead of buffering whole sources.
+func (repo *Repository) OpenSourceMedia(id string) (io.ReadCloser, error) {
 	repo.mu.RLock()
-	payload, readErr := os.ReadFile(repo.path("sources", id, "source.wav"))
-	repo.mu.RUnlock()
-	if readErr != nil {
-		if errors.Is(readErr, os.ErrNotExist) {
-			return domain.SourceAsset{}, nil, domain.E(domain.KindNotFound, "source_not_found", "source_id", "source media does not exist")
+	defer repo.mu.RUnlock()
+	handle, err := os.Open(repo.path("sources", id, "source.wav"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, domain.E(domain.KindNotFound, "source_not_found", "source_id", "source media does not exist")
 		}
-		return domain.SourceAsset{}, nil, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot read source media", readErr)
+		return nil, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot open source media", err)
 	}
-	digest := sha256.Sum256(payload)
-	if hex.EncodeToString(digest[:]) != asset.Digest {
-		return domain.SourceAsset{}, nil, domain.E(domain.KindInternal, "source_integrity_error", "source_id", "stored source digest does not match metadata")
-	}
-	return asset, payload, nil
+	return handle, nil
 }

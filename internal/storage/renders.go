@@ -2,6 +2,7 @@ package storage
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -31,35 +32,95 @@ func (repo *Repository) GetJob(id string) (domain.RenderJob, error) {
 	return job, nil
 }
 
-func (repo *Repository) CommitRenderArtifacts(id string, wav []byte, receipt domain.RenderReceipt) error {
+// StagedRender is an in-progress render publication: a private staging
+// directory holding the output stream, committed atomically with its receipt
+// or discarded without leaving any visible partial output.
+type StagedRender struct {
+	repo   *Repository
+	id     string
+	dir    string
+	output *os.File
+	closed bool
+}
+
+// BeginRenderStaging reserves a staging directory for a render and opens its
+// output file. It fails fast if the render identifier is already published.
+func (repo *Repository) BeginRenderStaging(id string) (domain.RenderStaging, error) {
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
 	final := repo.path("renders", id)
 	if _, err := os.Stat(final); err == nil {
-		return domain.E(domain.KindConflict, "render_conflict", "render_id", "render artifacts already exist")
+		return nil, domain.E(domain.KindConflict, "render_conflict", "render_id", "render artifacts already exist")
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot inspect render destination", err)
+		return nil, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot inspect render destination", err)
 	}
 	temp, err := os.MkdirTemp(repo.path("tmp"), "render-*")
 	if err != nil {
-		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot create render staging directory", err)
+		return nil, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot create render staging directory", err)
 	}
-	defer func() {
+	output, err := os.OpenFile(filepath.Join(temp, "output.wav"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+	if err != nil {
 		_ = os.RemoveAll(temp)
-	}()
-	if err := writeBytes(filepath.Join(temp, "output.wav"), wav, 0o640); err != nil {
-		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot write render output", err)
+		return nil, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot create render output", err)
 	}
-	if err := writeJSONAtomic(filepath.Join(temp, "receipt.json"), receipt, 0o640); err != nil {
+	return &StagedRender{repo: repo, id: id, dir: temp, output: output}, nil
+}
+
+// OutputWriter returns the staged output stream the renderer writes into.
+func (staged *StagedRender) OutputWriter() io.Writer {
+	return staged.output
+}
+
+// Commit closes and syncs the staged output, writes the receipt beside it,
+// and atomically renames the directory into the published renders index. The
+// receipt is therefore never visible without the complete output bytes.
+func (staged *StagedRender) Commit(receipt domain.RenderReceipt) error {
+	staged.repo.mu.Lock()
+	defer staged.repo.mu.Unlock()
+	if err := staged.closeLocked(); err != nil {
+		_ = os.RemoveAll(staged.dir)
+		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot finalize render output", err)
+	}
+	final := staged.repo.path("renders", staged.id)
+	if _, err := os.Stat(final); err == nil {
+		_ = os.RemoveAll(staged.dir)
+		return domain.E(domain.KindConflict, "render_conflict", "render_id", "render artifacts already exist")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		_ = os.RemoveAll(staged.dir)
+		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot inspect render destination", err)
+	}
+	if err := writeJSONAtomic(filepath.Join(staged.dir, "receipt.json"), receipt, 0o640); err != nil {
+		_ = os.RemoveAll(staged.dir)
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot write render receipt", err)
 	}
-	if err := os.Rename(temp, final); err != nil {
+	if err := os.Rename(staged.dir, final); err != nil {
+		_ = os.RemoveAll(staged.dir)
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot commit render artifacts", err)
 	}
-	if err := syncDirectory(repo.path("renders")); err != nil {
+	if err := syncDirectory(staged.repo.path("renders")); err != nil {
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot sync render index", err)
 	}
 	return nil
+}
+
+// Abort discards the staged output, removing every unpublished byte.
+func (staged *StagedRender) Abort() error {
+	staged.repo.mu.Lock()
+	defer staged.repo.mu.Unlock()
+	_ = staged.closeLocked()
+	return os.RemoveAll(staged.dir)
+}
+
+func (staged *StagedRender) closeLocked() error {
+	if staged.closed {
+		return nil
+	}
+	staged.closed = true
+	if err := staged.output.Sync(); err != nil {
+		_ = staged.output.Close()
+		return err
+	}
+	return staged.output.Close()
 }
 
 func (repo *Repository) GetRenderOutput(id string) ([]byte, domain.RenderReceipt, error) {

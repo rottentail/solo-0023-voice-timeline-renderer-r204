@@ -9,10 +9,20 @@ The implementation covers:
 
 - 16-bit integer PCM WAV validation and signal measurement.
 - Ordered timeline spans with source-frame selection, gain, and crossfade.
-- Linear sample-rate conversion and mono/stereo channel mapping.
-- Equal-power neighboring-span crossfades.
+- Correlation-adaptive crossfades: each joint is measured, and the fade law
+  moves between equal-power (uncorrelated) and constant-amplitude
+  (correlated) weights so seams stay flat and explainable. Unresolvable
+  anti-correlated joints keep the equal-power floor and are reported as
+  cancellation conflicts on the receipt — polarity and placement are never
+  altered to fake a flat seam.
+- Linear sample-rate conversion and mono/stereo channel mapping over bounded,
+  random-access frame windows.
+- Streaming mix and encode: joint analysis, mixing, and quantization hold no
+  full-length audio buffers, so a 64-span timeline at the frame limit renders
+  within a 128 MiB process RSS budget.
 - Peak normalization into a requested dBFS target.
-- Durable render states, receipts, and atomically committed output folders.
+- Durable render states, receipts with per-joint transition reports, and
+  atomically committed output folders.
 
 Automated tests are intentionally deferred. A later task stage will add unit,
 integration, and end-to-end verification around the production interfaces.
@@ -116,8 +126,15 @@ Response:
 ```
 
 Spans are sequential. A later span overlaps its predecessor by
-`crossfade_frames`; the overlap is mixed with equal-power weights. A crossfade
-must fit within both neighboring spans.
+`crossfade_frames`; the overlap is mixed with weights derived from the
+measured correlation between the two sides: `sin^gamma`/`cos^gamma` curves
+with `gamma = 1 + log2(1 + rho)` for positively correlated content
+(`gamma = 1` is the equal-power law used for uncorrelated content, `gamma = 2`
+the constant-amplitude law for identical content). A crossfade must fit
+within both neighboring spans. The receipt's `transitions` array records the
+measured correlation, curve, and exponent for every joint, and flags
+`cancellation` conflicts where anti-correlated content makes a flat seam
+impossible.
 
 ### Start a render
 
@@ -144,7 +161,8 @@ output folder.
 
 The output route returns `audio/wav`. The receipt records source digests, span
 placement, channel mapping, measured peak and RMS amplitude, normalization
-gain, output digest, and non-fatal warnings.
+gain, per-joint transition decisions (correlation, curve, exponent, conflicts),
+output digest, and non-fatal warnings.
 
 ## Data directory
 
@@ -173,8 +191,8 @@ cmd/timelinecheck/      workflow execution entry point
 internal/httpapi/       routing, request limits, JSON errors, media response
 internal/service/       workflow orchestration and idempotency
 internal/domain/        entities, validation, errors, and render transitions
-internal/audiocodec/    WAV handling, transforms, and signal measurement
-internal/render/        timeline preparation, mixing, normalization, receipt
+internal/audiocodec/    WAV handling, windowed frame reads, signal measurement
+internal/render/        span planning, joint analysis, mixing, normalization
 internal/storage/       atomic local repository
 internal/checkflow/     bounded production workflow checks
 ```
@@ -187,11 +205,17 @@ Run each declared production check from the repository root:
 go run ./cmd/timelinecheck -workflow ingest-audio-source
 go run ./cmd/timelinecheck -workflow compose-timeline
 go run ./cmd/timelinecheck -workflow render-mixdown
+go run ./cmd/timelinecheck -workflow crossfade-quality
 ```
 
 Each check creates an isolated temporary data directory, starts the real HTTP
-handler, sends generated WAV inputs, and verifies read-back or rendered output.
-The checks are bounded and do not require network access.
+handler, sends generated WAV inputs, and verifies read-back or rendered
+output. The `crossfade-quality` check additionally renders independently
+synthesized correlated, uncorrelated, and anti-correlated joints to measure
+seam levels, verifies cancellation reporting and double-sided fade placement,
+and renders a 64-span maximum timeline while asserting the process stays
+within the 128 MiB RSS budget with byte-identical re-renders. The checks are
+bounded and do not require network access.
 
 ## Deferred test boundary
 

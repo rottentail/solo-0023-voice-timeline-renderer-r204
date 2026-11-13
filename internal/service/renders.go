@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"voice-timeline-renderer/internal/domain"
@@ -55,32 +56,34 @@ func (s *Service) CreateRender(
 		return job, true, err
 	}
 
-	sources := make(map[string]render.SourceInput)
-	for _, span := range plan.Spans {
-		if _, loaded := sources[span.SourceID]; loaded {
-			continue
-		}
-		asset, payload, loadErr := s.repo.GetSource(span.SourceID)
-		if loadErr != nil {
-			return s.failRender(job, loadErr)
-		}
-		sources[span.SourceID] = render.SourceInput{Asset: asset, WAV: payload}
+	staging, err := s.repo.BeginRenderStaging(id)
+	if err != nil {
+		return s.failRender(job, err)
 	}
 	result, renderErr := render.Render(
 		ctx,
 		id,
 		plan,
-		sources,
+		s.repo,
 		render.Limits{MaxOutputFrames: s.config.MaxOutputFrames},
+		staging.OutputWriter(),
 		time.Now().UTC(),
 	)
 	if renderErr != nil {
+		_ = staging.Abort()
+		// Domain failures (missing or corrupt sources, limit violations) keep
+		// their stable codes; anything else is reported as a render failure.
+		var appErr *domain.AppError
+		if errors.As(renderErr, &appErr) {
+			return s.failRender(job, appErr)
+		}
 		return s.failRender(job, domain.Wrap(domain.KindInternal, "render_failed", "", "timeline rendering failed", renderErr))
 	}
 	if err := s.advanceJob(&job, domain.RenderFinalizing, nil); err != nil {
+		_ = staging.Abort()
 		return job, true, err
 	}
-	if err := s.repo.CommitRenderArtifacts(id, result.WAV, result.Receipt); err != nil {
+	if err := staging.Commit(result.Receipt); err != nil {
 		return s.failRender(job, err)
 	}
 	job.Output = &result.Output

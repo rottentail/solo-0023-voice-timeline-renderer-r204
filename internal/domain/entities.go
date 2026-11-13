@@ -1,6 +1,18 @@
 package domain
 
-import "time"
+import (
+	"io"
+	"time"
+)
+
+// RenderStaging is one in-progress render publication: the renderer streams
+// output bytes into it, then it is either committed with its receipt or
+// aborted without leaving visible partial output.
+type RenderStaging interface {
+	OutputWriter() io.Writer
+	Commit(receipt RenderReceipt) error
+	Abort() error
+}
 
 type SourceAsset struct {
 	ID            string    `json:"id"`
@@ -91,6 +103,18 @@ type NormalizationReceipt struct {
 	OutputPeakDBFS    float64 `json:"output_peak_dbfs"`
 }
 
+// ReceiptTransition describes one crossfade joint between neighboring spans.
+// It records the measured overlap correlation and the exact fade law that was
+// derived from it, so every seam can be explained and replayed.
+type ReceiptTransition struct {
+	SpanIndex       int     `json:"span_index"`
+	CrossfadeFrames int64   `json:"crossfade_frames"`
+	Correlation     float64 `json:"correlation"`
+	Curve           string  `json:"curve"`
+	Exponent        float64 `json:"exponent"`
+	Conflict        string  `json:"conflict,omitempty"`
+}
+
 type RenderReceipt struct {
 	SchemaVersion int                  `json:"schema_version"`
 	RenderID      string               `json:"render_id"`
@@ -98,6 +122,7 @@ type RenderReceipt struct {
 	Output        OutputAsset          `json:"output"`
 	Normalization NormalizationReceipt `json:"normalization"`
 	Spans         []ReceiptSpan        `json:"spans"`
+	Transitions   []ReceiptTransition  `json:"transitions,omitempty"`
 	Warnings      []string             `json:"warnings"`
 	CreatedAt     time.Time            `json:"created_at"`
 }
